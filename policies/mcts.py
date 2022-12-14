@@ -2,32 +2,52 @@ import numpy as np
 from envs.GymOthelloEnv import othello
 import math
 import torch
-from copy import deepcopy
+from scipy.special import softmax
+from policies import simple_policies
+from collections import OrderedDict
+from time import time
+
+# Game Constants
+BLACK_DISK = -1
+NO_DISK = 0
+WHITE_DISK = 1
+
+global copy_time
+copy_time = 0
+
 
 def copy_env(env):
-    new_env = deepcopy(env)
-    new_env.mute = True
+    global copy_time
+    start = time()
+    new_env = env.copy()
+    copy_time += time() - start
     return new_env
 
 class Node():
 
-    def __init__(self, env, Q_net=None, c=1, depth=0, parent=None):
+    def __init__(self, env, color = WHITE_DISK, Q_net=None, c=0.5, depth=0, parent=None, move=None):
         
         self.env = env
-        self.turn = env.player_turn
-        self.value = 0 # Number of wins this node has
+        self.color = color
         self.count = 0 # Number of times this node has been visited
+        self.win = 0 # Number of wins this node has
         self.parent = parent
-        self.child = {}
-        self.Q_net = Q_net
+        self.child = OrderedDict()
         self.c = c
         self.depth = depth
+        self.move = move
+        self.Q_net = Q_net
+        self.selected = None
+
+        if Q_net is not None:
+            obs = torch.from_numpy(self.env.get_observation(separate=True)).float()
+            self.value, self.ac_dist = Q_net(obs)
+            self.ac_dist = self.ac_dist.reshape(-1)
 
     def ucb(self):
         '''
-        Computes the UCB1 value of this node using the formula:
+        Computes the UCB1 or PUCB value of this node using the formula:
         UCB1(node) = exloitation + exploration 
-        UCB1(node) = wins / (visits) + sqrt(ln(parent_visits) / (visits))
         '''
         if self.parent is None:
             return 0
@@ -36,20 +56,12 @@ class Node():
         # Vanilla  MCTS
         if self.Q_net is None:
             exploration_score = self.c * np.sqrt(self.parent.count / (self.count + eps))
-            exploitation_score = self.value / (self.count + eps)
+            exploitation_score = self.win / (self.count + eps)
         
         # MCTS Augmented with a Neural Network
         else:
-            pass
-            # exploration_score = child.prior * np.sqrt(parent.count / (child.count + 1))
-            # obs = torch.from_numpy(self.env.get_observation(separate=True)).float()
-            # obs = obs.view(-1, 4, self.Q_net.board_size, self.Q_net.board_size)
-            # # print(obs)
-            # value, ac_probs = self.Q_net(obs)
-            # value = value.item()
-            # ac_probs = torch.flatten(ac_probs)
-            # # print(value, ac_probs)
-            # exploitation_score, ac_probs = value, ac_probs
+            exploration_score = self.c * self.ac_dist[self.move] * np.sqrt(self.parent.count / (self.count + eps))
+            exploitation_score = self.win / (self.count + eps)
 
         return exploitation_score + exploration_score
 
@@ -59,17 +71,19 @@ class Node():
         tree as new nodes
         '''
         # print('\n', self.env.get_possible_actions())
-        for ac in self.env.get_possible_actions():
+        for ac in self.env.possible_moves:
             new_env = copy_env(self.env)
             # print(ac, new_env.get_possible_actions(), f'turn={new_env.player_turn}')
             new_env.step(ac)
             # print('\t', new_env.get_possible_actions(), f'turn={new_env.player_turn}')
             self.child[ac] = Node(
                 env=new_env,
+                color = -self.color,
                 Q_net=self.Q_net, 
                 c=self.c,
                 depth=self.depth+1, 
-                parent=self
+                parent=self,
+                move=ac
                 )
 
     def select_child(self):
@@ -82,44 +96,83 @@ class Node():
         for ac in self.child.keys():
             child = self.child[ac]
             score = child.ucb()
+            
             if score > max_score:
                 max_score = score
                 selected_child = child
                 selected_ac = ac
+
         return selected_ac, selected_child
 
     def rollout(self):
         '''
         Performs a rollout from this game state
-        return 1 if won, 0 if lost
+        return color of winner
         '''
-        new_env = copy_env(self.env)
+        if self.env.terminated:
+            if self.env.winner == self.color:
+                self.win = math.inf
+                self.parent.win = -10000
+            elif self.env.winner == -self.color:
+                self.win = -10000
+            return self.env.winner
 
+        new_env = copy_env(self.env)
+        obs = torch.from_numpy(new_env.get_observation(separate=True)).float()
         while not new_env.terminated:
             # Light rollout
             if self.Q_net is None:
-                action = np.random.choice(new_env.get_possible_actions())
+                # action = maximin_policy.get_action(obs)
+                action = np.random.choice(new_env.possible_moves)
             else:
-                action # TODO
-            new_env.step(action)
+                action = self.Q_net.get_action(obs)
+                # action = np.random.choice(new_env.possible_moves)
+                # print(action, new_env.get_possible_actions())
+            obs = torch.from_numpy(new_env.step(action)[0]).float()
 
-        win = new_env.winner * self.turn
-        if win == 1:
-            reward = 1
-        elif win == 0:
-            reward = 0.5
-        else: #win == -1
-            reward = 0
+        return new_env.winner
 
-        return reward
+    def update(self, winner = None, leaf_color = None, leaf_v = None):
+        '''
+        Updates the node with the result of a game.
+
+        Args:  
+            winner: the winner of the game, as represented by a value from the game's state.
+            leaf_color: the color of the leaf node found at expansion phase in mcts
+        '''
+        self.count += 1
+        
+        if winner is not None:
+            if winner == self.color:
+                self.win += 1
+            else: #winner == -self.color:
+                self.win -= 1
+        else: # leaf_color is not none
+            if leaf_color == self.color:
+                self.win += leaf_v
+            else: #leaf_color == -self.color:
+                self.win -= leaf_v
     
     def draw_tree(self):
-        tree = '  '*self.depth + f'{self.count} {self.ucb()} {self.value} \n'
+        '''
+        Returns a string representation of the MCTS tree rooted at this node.
+        The representation includes the node's depth, count, UCB value, and value.
+
+        Returns:
+            str: the string representation of the tree.
+        '''
+        tree = '  '*self.depth + f'{self.count} {self.ucb()} {self.win} \n'
         for node in self.child.values():
             tree = tree + node.draw_tree()
         return tree
     
     def get_size(self):
+        '''
+        Returns the total number of nodes in the MCTS tree rooted at this node.
+
+        Returns:
+            int: the number of nodes in the tree.
+        '''
         total = 0
         to_visit = [self]
         while len(to_visit) > 0:
@@ -136,7 +189,7 @@ class MCTS():
         else:
             self.env = env
     
-        self.root = Node(copy_env(env), Q_net, c)
+        self.root = Node(copy_env(env), Q_net=Q_net, c=c)
         self.c = c
         self.iterations = iterations
         self.Q_net = Q_net
@@ -146,7 +199,7 @@ class MCTS():
             self.env = env.env
         else:
             self.env = env
-        self.root = Node(copy_env(env), self.Q_net, self.c)
+        self.root = Node(copy_env(env), Q_net=self.Q_net, c=self.c)
 
     def get_action(self, print_tree=False):
         '''
@@ -156,6 +209,14 @@ class MCTS():
         3. Rollout node
         4. Back propagation
         '''
+        # add dirichlet noise for more exploration with Q_net
+        if self.Q_net is not None:
+            # eps = 1 * np.random.rand()
+            eps = 1
+            board_size = self.env.board_size
+            self.root.ac_dist = ((1-eps)*self.root.ac_dist + 
+                                (eps)*(1/board_size**2)*torch.ones(board_size**2))
+
         for i in range(self.iterations):
             current = self.root
 
@@ -170,63 +231,50 @@ class MCTS():
                 current.expand()
                 _, current = current.select_child()
                 search_path.append(current)
-
-            value = current.rollout()
-            for node in search_path:
-                node.count += 1 
-                node.value += value
+            
+            if self.Q_net is None:
+                winner = current.rollout()
+                for node in search_path:
+                    node.update(winner=winner)
+            else:
+                leaf_color = current.color
+                leaf_v = current.value
+                for node in search_path:
+                    node.update(leaf_color=leaf_color, leaf_v=leaf_v)
         
         if print_tree:
             self.visualize()
 
-        # if self.Q_net == None:
-        #     value, ac_probs = 0, None
-        # else:
-        #     obs = torch.from_numpy(self.env.get_observation(separate=True)).float()
-        #     obs = obs.view(-1, 4, self.Q_net.board_size, self.Q_net.board_size)
-        #     # print(obs)
-        #     value, ac_probs = self.Q_net(obs)
-        #     value = value.item()
-        #     ac_probs = torch.flatten(ac_probs)
-        #     # print(value, ac_probs)
-        
-        # self.root = Node(env, 0, self.Q_net)
-        # self.root.expand(ac_probs)
-        
-        # for _ in range(self.iterations):
-        #     node = self.root
-        #     search_path = [node]
-        #     while len(node.child) > 0:
-        #         ac, node = node.select_child()
-        #         search_path.append(node)
-
-        #     value = self.env.winner
-        #     if not self.env.terminated:
-        #         obs = torch.from_numpy(self.env.get_observation(separate=True)).float()
-        #         obs = obs.view(-1, 4, self.Q_net.board_size, self.Q_net.board_size)
-        #         # print(obs)
-        #         value, ac_probs = self.Q_net(obs)
-        #         value = value.item()
-        #         ac_probs = torch.flatten(ac_probs)
-        #         # print(value, ac_probs)
-        #         node.expand(ac_probs)
-            
-        #     for node in search_path:
-        #         node.value += value
-        #         node.count += 1
-        
-        # action_dist = torch.distributions.categorical.Categorical(self.root.ac_probs)
-        # move = action_dist.sample().item()
-        # print(move)
-
-        move, _ = self.root.select_child()
+        if self.Q_net is None:
+            move, child = self.root.select_child()
+            self.root.selected = child
+        else:
+            t = 0.25
+            actions = self.root.env.possible_moves
+            ac_dist = np.zeros(len(actions))
+            for i in range(len(actions)):
+                ac = actions[i]
+                ac_dist[i] = self.root.child[ac].count
+            ac_dist = ac_dist ** (1/t) / np.sum(ac_dist ** (1/t))
+            move = np.random.choice(actions, 1, p=ac_dist).item()
+            # print(move, actions, ac_dist)
+            self.root.selected = self.root.child[move]
         return move
+
+    def update_root(self, move):
+        self.env.step(move)
+        if move not in self.root.child.keys():
+            self.root.expand()
+        self.root = self.root.child[move]
     
     def visualize(self):
         print(self.root.draw_tree())
 
     def tree_size(self):
         return self.root.get_size()
+
+    def print_copy_time(self):
+        print(f'copy time: {copy_time}')
 
 
 class ReplayBuffer():
@@ -241,15 +289,72 @@ class ReplayBuffer():
         '''
         Resets the buffer
         '''
+        self.buffer = []
 
-    def sample(self, num_samples):
+    def sample(self, num_samples=1000):
         '''
-        Returns a subset of the buffer of size num_samples
-        '''
-        pass
+        Returns a random subset of the buffer of size num_samples.
+        If num_samples is greater than the length of the buffer, 
+        returns the entire buffer.
 
-    def store(self, tree: MCTS):
+        Returns:
+            tuple: (observations, actions, values)
         '''
-        Stores all moves in MCTS into the buffer
-        '''
+        num_samples = min(num_samples, len(self.buffer))
+        observations, actions, values = [], [], []
 
+        np.random.shuffle(self.buffer)
+        for obs, ac, value in self.buffer[0:num_samples]:
+            observations.append(obs)
+            actions.append(ac)
+            values.append(value)
+        return np.array(observations), np.array(actions), np.array(values)
+
+    def store(self, root: Node, winner):
+        '''
+        Stores all moves in MCTS into the buffer.
+
+        Args:
+            root: the root node of the MCTS tree.
+        '''
+        current = root
+        board_size = root.env.board_size
+        ac_dist_size = board_size**2
+
+        while current.selected is not None:
+            ac_dist = np.zeros(ac_dist_size)
+            for ac, node in current.child.items():
+                ac_dist[ac] = node.count
+
+            ac_dist = ac_dist / np.sum(ac_dist)
+            ac_dist_2d = np.reshape(ac_dist, (board_size, board_size))
+            
+            # Store all symmetries of each board state as well
+            for i in range(4):
+                current.env.rotate90()
+                ac_dist_2d = np.rot90(ac_dist_2d)
+                sym_ac_dist = np.ndarray.flatten(ac_dist_2d)
+                self.buffer.append((
+                    current.env.get_observation(separate=True),
+                    sym_ac_dist,
+                    winner * current.color
+                ))
+
+                current.env.flip()
+                ac_dist_2d = np.flip(ac_dist_2d, axis=1)
+                sym_ac_dist = np.ndarray.flatten(ac_dist_2d)
+                self.buffer.append((
+                    current.env.get_observation(separate=True),
+                    sym_ac_dist,
+                    winner * current.color
+                ))
+        
+                current.env.flip()
+                ac_dist_2d = np.flip(ac_dist_2d, axis=1)
+
+            current = current.selected
+
+        # Trim the buffer if it has exceeded the capacity
+        if len(self.buffer) > self.capacity:
+            self.buffer = self.buffer[-self.capacity:]
+        

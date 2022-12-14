@@ -31,7 +31,7 @@ class RandomPolicy(object):
     def seed(self, seed):
         self.rnd = np.random.RandomState(seed=seed)
 
-    def get_action(self, obs):
+    def get_action(self, obs=None):
         possible_moves = self.env.possible_moves
         ix = self.rnd.randint(0, len(possible_moves))
         action = possible_moves[ix]
@@ -200,7 +200,7 @@ class MaxiMinPolicy(object):
                                      perspective=my_perspective,
                                      my_perspective=my_perspective)
 
-        print(move)
+        # print(move)
         return move
 
 

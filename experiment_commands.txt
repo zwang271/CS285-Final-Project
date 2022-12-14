@@ -1,0 +1,16 @@
+Testing MCTS
+python run_game.py --protagonist mcts --opponent-search-depth 3 --init-rand-steps 4
+
+
+Minimax Showcase for Alpha Beta Pruning
+python run_game.py --protagonist maximin --opponent maximin --protagonist-search-depth 3 --opponent-search-depth 3 --init-rand-steps 4
+
+
+
+
+
+
+
+
+
+
