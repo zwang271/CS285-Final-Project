@@ -41,13 +41,13 @@ class Node():
 
         if Q_net is not None:
             obs = torch.from_numpy(self.env.get_observation(separate=True)).float()
-            self.value, self.ac_dist = Q_net(obs)
+            self.value, self.ac_dist = Q_net.evaluate(obs)
             self.ac_dist = self.ac_dist.reshape(-1)
 
     def ucb(self):
         '''
         Computes the UCB1 or PUCB value of this node using the formula:
-        UCB1(node) = exloitation + exploration 
+        UCB1(node) = exploitation + exploration 
         '''
         if self.parent is None:
             return 0
@@ -60,7 +60,8 @@ class Node():
         
         # MCTS Augmented with a Neural Network
         else:
-            exploration_score = self.c * self.ac_dist[self.move] * np.sqrt(self.parent.count / (self.count + eps))
+            exploration_score = self.c * self.parent.ac_dist[self.move] * np.sqrt(self.parent.count) / (self.count + 1)
+            # print(exploration_score)
             exploitation_score = self.win / (self.count + eps)
 
         return exploitation_score + exploration_score
@@ -148,6 +149,13 @@ class Node():
             else: #winner == -self.color:
                 self.win -= 1
         else: # leaf_color is not none
+            if self.env.terminated:
+                if self.env.winner == self.color:
+                    self.win = 10000
+                    self.parent.win = -10000
+                elif self.env.winner == -self.color:
+                    self.win = -10000
+            # CRITICAL
             if leaf_color == self.color:
                 self.win += leaf_v
             else: #leaf_color == -self.color:
@@ -211,8 +219,7 @@ class MCTS():
         '''
         # add dirichlet noise for more exploration with Q_net
         if self.Q_net is not None:
-            # eps = 1 * np.random.rand()
-            eps = 1
+            eps = 0.25 * np.random.rand()
             board_size = self.env.board_size
             self.root.ac_dist = ((1-eps)*self.root.ac_dist + 
                                 (eps)*(1/board_size**2)*torch.ones(board_size**2))
@@ -281,15 +288,24 @@ class ReplayBuffer():
     '''
     Stores tuples of (obs, ac, value, )
     '''
-    def __init__(self, capacity=10_000):
+    def __init__(self, capacity=30_000):
         self.capacity = capacity  
-        self.buffer = []  
+        self.buffer = [] 
+        self.last_sample = 0 
 
     def reset(self):
         '''
         Resets the buffer
         '''
         self.buffer = []
+
+    def merge(self, RB):
+        self.buffer.extend(RB.buffer)
+        if len(self.buffer) > self.capacity:
+            self.buffer = self.buffer[-self.capacity:]
+
+    def shuffle(self):
+        np.random.shuffle(self.buffer)
 
     def sample(self, num_samples=1000):
         '''
@@ -303,11 +319,15 @@ class ReplayBuffer():
         num_samples = min(num_samples, len(self.buffer))
         observations, actions, values = [], [], []
 
-        np.random.shuffle(self.buffer)
-        for obs, ac, value in self.buffer[0:num_samples]:
+        end = min(self.last_sample+1000, len(self.buffer))
+        for obs, ac, value in self.buffer[self.last_sample:end]:
             observations.append(obs)
             actions.append(ac)
             values.append(value)
+        self.last_sample = end
+        if end == len(self.buffer):
+            self.last_sample = 0
+            self.shuffle()
         return np.array(observations), np.array(actions), np.array(values)
 
     def store(self, root: Node, winner):
@@ -327,6 +347,9 @@ class ReplayBuffer():
                 ac_dist[ac] = node.count
 
             ac_dist = ac_dist / np.sum(ac_dist)
+            t = 0.25
+            ac_dist = ac_dist ** (1/t) / np.sum(ac_dist ** (1/t))
+
             ac_dist_2d = np.reshape(ac_dist, (board_size, board_size))
             
             # Store all symmetries of each board state as well
